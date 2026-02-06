@@ -1,106 +1,219 @@
+const DEFAULT_TIMEOUT = 10000;
+const POPUP_CLOSE_SELECTOR = '.popzoneclose_day';
 
-// Helper to wait for element
-const waitForElement = (selector, timeout = 5000) => {
-    return new Promise((resolve, reject) => {
-        const element = document.querySelector(selector);
-        if (element) return resolve(element);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-        const observer = new MutationObserver(() => {
-            const element = document.querySelector(selector);
-            if (element) {
-                resolve(element);
-                observer.disconnect();
-            }
-        });
+const waitForElement = (selector, timeout = DEFAULT_TIMEOUT) => {
+  return new Promise((resolve, reject) => {
+    const existing = document.querySelector(selector);
+    if (existing) {
+      resolve(existing);
+      return;
+    }
 
-        observer.observe(document.body, {
-            childList: true,
-            subtree: true,
-        });
-
-        setTimeout(() => {
-            observer.disconnect();
-            reject(new Error(`Timeout waiting for element: ${selector}`));
-        }, timeout);
+    const observer = new MutationObserver(() => {
+      const element = document.querySelector(selector);
+      if (element) {
+        observer.disconnect();
+        resolve(element);
+      }
     });
+
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    setTimeout(() => {
+      observer.disconnect();
+      reject(new Error(`Timeout waiting for element: ${selector}`));
+    }, timeout);
+  });
+};
+
+const waitForPageReady = async () => {
+  if (document.readyState === 'loading') {
+    await new Promise((resolve) => {
+      document.addEventListener('DOMContentLoaded', resolve, { once: true });
+    });
+  }
+};
+
+const setInputValue = (input, value) => {
+  const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+
+  if (nativeInputValueSetter) {
+    nativeInputValueSetter.call(input, value);
+  } else {
+    input.value = value;
+  }
+
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+};
+
+const closeInitialPopupIfExists = async () => {
+  await waitForPageReady();
+  const closeButton = document.querySelector(POPUP_CLOSE_SELECTOR);
+  if (closeButton) {
+    closeButton.click();
+  }
+};
+
+const parseRowData = (row) => {
+  if (typeof row === 'object' && row !== null) {
+    const id = row.id ?? row.ID ?? row.userId ?? row.username ?? '';
+    const password = row.password ?? row.PASSWORD ?? row.pw ?? row.passwd ?? '';
+    return { id: String(id).trim(), password: String(password).trim() };
+  }
+
+  const [id = '', password = ''] = String(row).split(/,|\t|\|/);
+  return { id: id.trim(), password: password.trim() };
+};
+
+const invokeNetfunnelLoginMove = () => {
+  if (typeof window.NetFunnel_Action === 'function') {
+    window.NetFunnel_Action(
+      { action_id: 'OLS_ACT_1' },
+      () => {
+        location.href = '/ols/man/SMAN020M/page.do';
+      },
+    );
+    return;
+  }
+
+  throw new Error('NetFunnel_Action 함수를 찾을 수 없습니다.');
+};
+
+const ensureLoginPage = async () => {
+  const loginButton = document.querySelector('button.btn_login, button[value="로그인"]');
+  if (loginButton) {
+    return;
+  }
+
+  const logoutButton = Array.from(document.querySelectorAll('button, a, [role="button"], [onclick]')).find((el) =>
+    (el.textContent || '').includes('로그아웃'),
+  );
+
+  if (logoutButton) {
+    logoutButton.click();
+    await sleep(800);
+  }
+
+  invokeNetfunnelLoginMove();
+  await sleep(1500);
+};
+
+const clickIdLoginTab = async () => {
+  const tabLink = document.querySelector('#tab_item_01 a');
+  if (!tabLink) {
+    throw new Error('아이디 로그인 탭(#tab_item_01 a)을 찾을 수 없습니다.');
+  }
+
+  tabLink.click();
+  await sleep(300);
+};
+
+const fillCredentials = async ({ id, password }) => {
+  if (!id || !password) {
+    throw new Error('ID 또는 PW 데이터가 비어 있습니다.');
+  }
+
+  const idInput = await waitForElement('#mbrId');
+  const pwInput = await waitForElement('#pwd');
+
+  idInput.focus();
+  setInputValue(idInput, id);
+
+  pwInput.focus();
+  setInputValue(pwInput, password);
+};
+
+const clickLoginButton = async () => {
+  const loginButton = await waitForElement('button.btn_login');
+  loginButton.click();
+};
+
+const waitForLoginResult = async () => {
+  const startUrl = location.href;
+  const timeoutMs = 7000;
+  const intervalMs = 250;
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const loginButton = document.querySelector('button.btn_login, button[value="로그인"]');
+    const logoutButton = Array.from(document.querySelectorAll('button, a, [role="button"], [onclick]')).find((el) =>
+      (el.textContent || '').includes('로그아웃'),
+    );
+
+    const movedToDifferentPage = location.href !== startUrl;
+
+    if (logoutButton || movedToDifferentPage) {
+      return { success: true };
+    }
+
+    if (!loginButton) {
+      return { success: true };
+    }
+
+    await sleep(intervalMs);
+  }
+
+  return {
+    success: false,
+    reason: '로그인 성공 상태를 확인하지 못했습니다. 로그인 실패로 판단하여 현재 화면에서 중지합니다.',
+  };
+};
+
+const runPhase1 = async (credentials) => {
+  await closeInitialPopupIfExists();
+  await ensureLoginPage();
+  await clickIdLoginTab();
+  await fillCredentials(credentials);
+  await sleep(250);
+  await clickLoginButton();
+  return waitForLoginResult();
 };
 
 const processQueue = async () => {
-    const data = await chrome.storage.local.get([
-        'taskQueue',
-        'currentIndex',
-        'isProcessing',
-        'targetSelector',
-        'inputSelector'
-    ]);
+  const data = await chrome.storage.local.get(['taskQueue', 'currentIndex', 'isProcessing']);
+  const { taskQueue = [], currentIndex = 0, isProcessing } = data;
 
-    const { taskQueue, currentIndex, isProcessing, targetSelector, inputSelector } = data;
+  if (!isProcessing) {
+    return;
+  }
 
-    if (!isProcessing || !taskQueue || currentIndex === undefined) return;
+  if (!Array.isArray(taskQueue) || currentIndex >= taskQueue.length) {
+    await chrome.storage.local.set({ isProcessing: false });
+    alert('모든 작업이 완료되었습니다.');
+    return;
+  }
 
-    if (currentIndex >= taskQueue.length) {
-        console.log('DOM Automator: All tasks completed.');
-        await chrome.storage.local.set({ isProcessing: false });
-        alert('모든 작업이 완료되었습니다.');
-        return;
+  const credentials = parseRowData(taskQueue[currentIndex]);
+
+  try {
+    const loginResult = await runPhase1(credentials);
+
+    if (!loginResult.success) {
+      await chrome.storage.local.set({ isProcessing: false });
+      alert(loginResult.reason);
+      return;
     }
 
-    const currentData = taskQueue[currentIndex];
-    console.log(`DOM Automator: Processing item ${currentIndex + 1}/${taskQueue.length}: ${currentData}`);
+    const nextIndex = currentIndex + 1;
+    await chrome.storage.local.set({ currentIndex: nextIndex });
 
-    try {
-        // 1. Fill Input (if selector provided)
-        if (inputSelector) {
-            const inputEl = await waitForElement(inputSelector);
-
-            // Try to set value in a React-friendly way if possible, basically dispatch input event
-            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-            nativeInputValueSetter.call(inputEl, currentData);
-
-            inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-            inputEl.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-
-        // 2. Click Button
-        if (targetSelector) {
-            const btnEl = await waitForElement(targetSelector);
-
-            // Small delay to ensure input is processed
-            await new Promise(r => setTimeout(r, 500));
-
-            btnEl.click();
-        }
-
-        // 3. Update Index
-        await chrome.storage.local.set({ currentIndex: currentIndex + 1 });
-
-        // Note: If the page reloads, this script runs again and picks up the new index.
-        // If it's an SPA and doesn't reload, we might need a loop or trigger.
-        // For now, assuming page reload or some navigation. 
-        // If NO navigation happens, we should probably check again?
-        // Let's add a small polling mechanism or just wait for next load if it's MP.
-        // However, if the button click doesn't cause a reload, we just stop? 
-        // Let's add a recursive call with delay for SPA support if the URL doesn't change.
-
-        // For safety, let's just listen for reloads mainly, but maybe wait a bit and check if we are still on the same page state?
-        // The safest "Batch" automation usually assumes the action leads to a new "Blank" state or reload.
-        // Let's leave it as "run on load" for now, which handles the "refresh" case well.
-
-    } catch (error) {
-        console.error('DOM Automator Error:', error);
-        // Option: Stop on error or skip? 
-        // Let's stop for safety.
-        await chrome.storage.local.set({ isProcessing: false });
-        alert(`오류 발생: ${error.message}`);
+    if (nextIndex >= taskQueue.length) {
+      await chrome.storage.local.set({ isProcessing: false });
     }
+  } catch (error) {
+    console.error('DOM Automator Error:', error);
+    await chrome.storage.local.set({ isProcessing: false });
+    alert(`오류 발생: ${error.message}`);
+  }
 };
 
-// Run on load
-processQueue();
+closeInitialPopupIfExists();
 
-// Listen for manual trigger from Popup
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    if (request.action === 'START_BATCH') {
-        processQueue();
-    }
+chrome.runtime.onMessage.addListener((request) => {
+  if (request.action === 'START_BATCH') {
+    processQueue();
+  }
 });
